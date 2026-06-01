@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"net"
 	"sync"
@@ -24,6 +25,54 @@ import (
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 )
+
+const (
+	urlTestBreakerThreshold = 3
+	urlTestBreakerCooldown  = 30 * time.Second
+)
+
+// outboundBreaker is a per-outbound, per-network circuit breaker driven by real
+// connection results. It never participates in delay-based ranking; it only
+// temporarily excludes an in-use outbound that keeps failing real dials.
+type outboundBreaker struct {
+	access       sync.Mutex
+	failures     int32
+	trippedUntil int64 // unix-nano cooldown deadline; 0 = healthy
+}
+
+func (b *outboundBreaker) tripped(now int64) bool {
+	b.access.Lock()
+	defer b.access.Unlock()
+	return b.trippedUntil > now
+}
+
+func (b *outboundBreaker) until() int64 {
+	b.access.Lock()
+	defer b.access.Unlock()
+	return b.trippedUntil
+}
+
+func (b *outboundBreaker) recordSuccess() {
+	b.access.Lock()
+	defer b.access.Unlock()
+	b.failures = 0
+	b.trippedUntil = 0
+}
+
+func (b *outboundBreaker) recordFailure(now int64) bool {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.trippedUntil > now {
+		return false
+	}
+	b.failures++
+	if b.failures < urlTestBreakerThreshold {
+		return false
+	}
+	b.failures = 0
+	b.trippedUntil = time.Unix(0, now).Add(urlTestBreakerCooldown).UnixNano()
+	return true
+}
 
 func RegisterURLTest(registry *outbound.Registry) {
 	outbound.Register[option.URLTestOutboundOptions](registry, C.TypeURLTest, NewURLTest)
@@ -100,10 +149,10 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
+	if outbound := s.group.selectedOutboundTCP.Load(); outbound != nil {
+		return outbound.Tag()
+	} else if outbound := s.group.selectedOutboundUDP.Load(); outbound != nil {
+		return outbound.Tag()
 	}
 	return ""
 }
@@ -118,11 +167,13 @@ func (s *URLTest) References() []string {
 		return nil
 	}
 	var references []string
-	if group.selectedOutboundTCP != nil {
-		references = append(references, group.selectedOutboundTCP.Tag())
+	selectedTCP := group.selectedOutboundTCP.Load()
+	selectedUDP := group.selectedOutboundUDP.Load()
+	if selectedTCP != nil {
+		references = append(references, selectedTCP.Tag())
 	}
-	if group.selectedOutboundUDP != nil && group.selectedOutboundUDP != group.selectedOutboundTCP {
-		references = append(references, group.selectedOutboundUDP.Tag())
+	if selectedUDP != nil && selectedUDP != selectedTCP {
+		references = append(references, selectedUDP.Tag())
 	}
 	return references
 }
@@ -159,34 +210,36 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
+	netName := N.NetworkName(network)
 	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
+	switch netName {
 	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
+		outbound = s.group.selectedOutboundTCP.Load()
 	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
+		outbound = s.group.selectedOutboundUDP.Load()
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
+	if outbound == nil || s.group.isTripped(netName, outbound.Tag()) {
+		outbound, _ = s.group.Select(netName)
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		s.group.recordSuccess(netName, outbound.Tag())
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.recordFailure(ctx, netName, outbound.Tag(), err)
 	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
-	if outbound == nil {
+	outbound := s.group.selectedOutboundUDP.Load()
+	if outbound == nil || s.group.isTripped(N.NetworkUDP, outbound.Tag()) {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
 	if outbound == nil {
@@ -194,10 +247,11 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		s.group.recordSuccess(N.NetworkUDP, outbound.Tag())
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.recordFailure(ctx, N.NetworkUDP, outbound.Tag(), err)
 	return nil, err
 }
 
@@ -224,8 +278,10 @@ type URLTestGroup struct {
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
 	checking                     atomic.Bool
-	selectedOutboundTCP          adapter.Outbound
-	selectedOutboundUDP          adapter.Outbound
+	selectedOutboundTCP          common.TypedValue[adapter.Outbound]
+	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
+	breakersTCP                  map[string]*outboundBreaker
+	breakersUDP                  map[string]*outboundBreaker
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.Mutex
@@ -253,11 +309,19 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
+	breakersTCP := make(map[string]*outboundBreaker, len(outbounds))
+	breakersUDP := make(map[string]*outboundBreaker, len(outbounds))
+	for _, detour := range outbounds {
+		breakersTCP[detour.Tag()] = &outboundBreaker{}
+		breakersUDP[detour.Tag()] = &outboundBreaker{}
+	}
 	return &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
+		breakersTCP:                  breakersTCP,
+		breakersUDP:                  breakersUDP,
 		link:                         link,
 		interval:                     interval,
 		tolerance:                    tolerance,
@@ -309,26 +373,30 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	now := time.Now().UnixNano()
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, g.selectedOutboundTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
+		if current := g.selectedOutboundTCP.Load(); current != nil && !g.isTrippedAt(network, current.Tag(), now) {
+			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, current)); history != nil {
+				minOutbound = current
 				minDelay = history.Delay
 			}
 		}
 	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, g.selectedOutboundUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
+		if current := g.selectedOutboundUDP.Load(); current != nil && !g.isTrippedAt(network, current.Tag(), now) {
+			if history := g.history.LoadURLTestHistory(RealTag(g.outbound, current)); history != nil {
+				minOutbound = current
 				minDelay = history.Delay
 			}
 		}
 	}
 	for _, detour := range g.outbounds {
 		if !common.Contains(detour.Network(), network) {
+			continue
+		}
+		if g.isTrippedAt(network, detour.Tag(), now) {
 			continue
 		}
 		history := g.history.LoadURLTestHistory(RealTag(g.outbound, detour))
@@ -341,15 +409,98 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		}
 	}
 	if minOutbound == nil {
+		// fail-open: prefer any untripped supported outbound even without history;
+		// only if every candidate is tripped, fall back to the one whose cooldown
+		// expires soonest, so we never leave the group with nothing to dial.
+		var earliest adapter.Outbound
+		var earliestUntil int64
 		for _, detour := range g.outbounds {
 			if !common.Contains(detour.Network(), network) {
 				continue
 			}
-			return detour, false
+			if !g.isTrippedAt(network, detour.Tag(), now) {
+				return detour, false
+			}
+			if until := g.breakerUntil(network, detour.Tag()); earliest == nil || until < earliestUntil {
+				earliest = detour
+				earliestUntil = until
+			}
 		}
-		return nil, false
+		return earliest, false
 	}
 	return minOutbound, true
+}
+
+func (g *URLTestGroup) breaker(network, tag string) *outboundBreaker {
+	if network == N.NetworkUDP {
+		return g.breakersUDP[tag]
+	}
+	return g.breakersTCP[tag]
+}
+
+func (g *URLTestGroup) isTripped(network, tag string) bool {
+	return g.isTrippedAt(network, tag, time.Now().UnixNano())
+}
+
+func (g *URLTestGroup) isTrippedAt(network, tag string, now int64) bool {
+	b := g.breaker(network, tag)
+	return b != nil && b.tripped(now)
+}
+
+func (g *URLTestGroup) breakerUntil(network, tag string) int64 {
+	if b := g.breaker(network, tag); b != nil {
+		return b.until()
+	}
+	return 0
+}
+
+func (g *URLTestGroup) recordSuccess(network, tag string) {
+	if b := g.breaker(network, tag); b != nil {
+		b.recordSuccess()
+	}
+}
+
+func (g *URLTestGroup) recordFailure(ctx context.Context, network, tag string, err error) {
+	// Caller cancellation is not an outbound-health signal. An outbound's own
+	// timeout still counts when the caller context remains active.
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	b := g.breaker(network, tag)
+	if b == nil || !b.recordFailure(time.Now().UnixNano()) {
+		return
+	}
+	g.logger.Debug("outbound ", tag, " tripped breaker on ", network, ", cooling down for ", urlTestBreakerCooldown)
+	// Treat a trip as a selection-changing event: drop the tripped outbound from
+	// the cache now instead of waiting for the next periodic probe.
+	g.reselect(network)
+}
+
+// reselect re-runs selection for one network and, if it changes the cached
+// outbound, interrupts existing connections so they move to the new pick.
+func (g *URLTestGroup) reselect(network string) {
+	g.updateAccess.Lock()
+	defer g.updateAccess.Unlock()
+	outbound, _ := g.Select(network)
+	if outbound == nil {
+		return
+	}
+	var changed bool
+	switch network {
+	case N.NetworkTCP:
+		if current := g.selectedOutboundTCP.Load(); current != outbound {
+			changed = current != nil
+			g.selectedOutboundTCP.Store(outbound)
+		}
+	case N.NetworkUDP:
+		if current := g.selectedOutboundUDP.Load(); current != outbound {
+			changed = current != nil
+			g.selectedOutboundUDP.Store(outbound)
+		}
+	}
+	if changed {
+		g.interruptGroup.Interrupt(g.interruptExternalConnections)
+	}
 }
 
 func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
@@ -505,19 +656,25 @@ func (g *URLTestGroup) performUpdateCheck() {
 		updated  bool
 		selected bool
 	)
-	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
-		if g.selectedOutboundTCP != nil {
-			updated = true
+	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil {
+		current := g.selectedOutboundTCP.Load()
+		if current == nil || (exists && outbound != current) {
+			if current != nil {
+				updated = true
+			}
+			g.selectedOutboundTCP.Store(outbound)
+			selected = true
 		}
-		g.selectedOutboundTCP = outbound
-		selected = true
 	}
-	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
-		if g.selectedOutboundUDP != nil {
-			updated = true
+	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil {
+		current := g.selectedOutboundUDP.Load()
+		if current == nil || (exists && outbound != current) {
+			if current != nil {
+				updated = true
+			}
+			g.selectedOutboundUDP.Store(outbound)
+			selected = true
 		}
-		g.selectedOutboundUDP = outbound
-		selected = true
 	}
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
