@@ -209,6 +209,7 @@ nav:
           - DERP: configuration/service/derp.md
           - Resolved: configuration/service/resolved.md
           - SSM API: configuration/service/ssm-api.md
+          - Traffic Telemetry: configuration/service/traffic-telemetry.md
           - CCM: configuration/service/ccm.md
           - OCM: configuration/service/ocm.md
           - Hysteria Realm: configuration/service/hysteria-realm.md

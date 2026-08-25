@@ -2,6 +2,7 @@ package trafficcontrol
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -106,6 +107,10 @@ func (m *Manager) leave(tracker Tracker) {
 	}
 	metadata.ClosedAt = closedAt
 	metadataCopy := *metadata
+	metadataCopy.Upload = new(atomic.Int64)
+	metadataCopy.Upload.Store(metadata.Upload.Load())
+	metadataCopy.Download = new(atomic.Int64)
+	metadataCopy.Download.Store(metadata.Download.Load())
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		evicted := m.closedConnections.PopFront()
 		m.closedUploadTotal += evicted.Upload.Load()

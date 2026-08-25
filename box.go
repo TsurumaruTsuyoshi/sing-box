@@ -168,6 +168,9 @@ func New(options Options) (*Box, error) {
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
+	needTrafficManager := needClashAPI || needAPIService || options.PlatformLogWriter != nil || common.Any(options.Services, func(it option.Service) bool {
+		return it.Type == C.TypeTrafficTelemetry
+	})
 	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
 		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
 	}
@@ -245,7 +248,7 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
 	}
-	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
+	if needTrafficManager {
 		trafficManager := trafficcontrol.NewManager(outboundManager)
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)

@@ -30,6 +30,7 @@ icon: material/new-box
 | `ocm`             | [OCM](./ocm)                          |
 | `resolved`        | [Resolved](./resolved)                |
 | `ssm-api`         | [SSM API](./ssm-api)                  |
+| `traffic-telemetry` | [Traffic Telemetry](./traffic-telemetry) |
 | `usbip-server`    | [USB/IP Server](./usbip-server)       |
 | `usbip-client`    | [USB/IP Client](./usbip-client)       |
 
