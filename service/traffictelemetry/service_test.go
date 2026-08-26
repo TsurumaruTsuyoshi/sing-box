@@ -58,7 +58,9 @@ func TestConnectionRecord(t *testing.T) {
 					Addr: netip.MustParseAddr("192.0.2.10"),
 					Port: 12345,
 				},
-				User: "alice",
+				Destination: metadata.Socksaddr{Fqdn: "requested.example"},
+				Domain:      "sniffed.example",
+				User:        "alice",
 			},
 			Outbound:     "proxy-out",
 			OutboundType: "shadowsocks",
@@ -76,6 +78,7 @@ func TestConnectionRecord(t *testing.T) {
 	require.Equal(t, int64(12345), attrs["source.port"].AsInt64())
 	require.Equal(t, "tcp", attrs["network.transport"].AsString())
 	require.Equal(t, "mixed-in", attrs["inbound"].AsString())
+	require.Equal(t, "sniffed.example", attrs["destination.domain"].AsString())
 	require.Equal(t, "alice", attrs["user"].AsString())
 	require.Equal(t, "proxy-out", attrs["outbound"].AsString())
 	require.Equal(t, "shadowsocks", attrs["outbound.type"].AsString())
@@ -88,6 +91,42 @@ func TestConnectionRecord(t *testing.T) {
 	require.Equal(t, otelLog.KindInt64, attrs["duration.ms"].Kind())
 	require.NotContains(t, attrs, "destination")
 	require.NotContains(t, attrs, "chain")
+}
+
+func TestConnectionRecordDestinationFQDNFallback(t *testing.T) {
+	closedAt := time.Unix(150, 0)
+	event := trafficcontrol.ConnectionEvent{
+		ID:       uuid.Must(uuid.NewV4()),
+		ClosedAt: closedAt,
+		Metadata: &trafficcontrol.TrackerMetadata{
+			CreatedAt: closedAt.Add(-time.Second),
+			Metadata: adapter.InboundContext{
+				Domain:      "192.0.2.1",
+				Destination: metadata.Socksaddr{Fqdn: "requested.example"},
+			},
+		},
+	}
+
+	attrs := recordAttributes(connectionRecord(event, closedAt))
+	require.Equal(t, "requested.example", attrs["destination.domain"].AsString())
+}
+
+func TestConnectionRecordDoesNotExportDestinationIPAsDomain(t *testing.T) {
+	closedAt := time.Unix(175, 0)
+	event := trafficcontrol.ConnectionEvent{
+		ID:       uuid.Must(uuid.NewV4()),
+		ClosedAt: closedAt,
+		Metadata: &trafficcontrol.TrackerMetadata{
+			CreatedAt: closedAt.Add(-time.Second),
+			Metadata: adapter.InboundContext{
+				Domain:      "2001:db8::1",
+				Destination: metadata.Socksaddr{Fqdn: "192.0.2.1"},
+			},
+		},
+	}
+
+	attrs := recordAttributes(connectionRecord(event, closedAt))
+	require.NotContains(t, attrs, "destination.domain")
 }
 
 func TestConnectionRecordOptionalFields(t *testing.T) {
@@ -109,6 +148,7 @@ func TestConnectionRecordOptionalFields(t *testing.T) {
 	attrs := recordAttributes(record)
 	require.NotContains(t, attrs, "user")
 	require.NotContains(t, attrs, "source.ip")
+	require.NotContains(t, attrs, "destination.domain")
 	require.Equal(t, otelLog.KindInt64, attrs["source.port"].Kind())
 	require.Equal(t, otelLog.KindInt64, attrs["upload.bytes"].Kind())
 	require.Equal(t, otelLog.KindInt64, attrs["download.bytes"].Kind())
@@ -223,6 +263,7 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	require.Equal(t, int64(12345), attrs["source.port"].GetIntValue())
 	require.Equal(t, "tcp", attrs["network.transport"].GetStringValue())
 	require.Equal(t, "mixed-in", attrs["inbound"].GetStringValue())
+	require.Equal(t, "telemetry.example", attrs["destination.domain"].GetStringValue())
 	require.Equal(t, "alice", attrs["user"].GetStringValue())
 	require.Equal(t, "proxy-out", attrs["outbound"].GetStringValue())
 	require.Equal(t, "shadowsocks", attrs["outbound.type"].GetStringValue())
@@ -338,7 +379,8 @@ func testConnectionEvent(id uuid.UUID, closedAt time.Time, outboundType string) 
 					Addr: netip.MustParseAddr("192.0.2.10"),
 					Port: 12345,
 				},
-				User: "alice",
+				Domain: "telemetry.example",
+				User:   "alice",
 			},
 			Outbound:     "proxy-out",
 			OutboundType: outboundType,

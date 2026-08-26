@@ -3,6 +3,7 @@ package traffictelemetry
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"time"
@@ -207,7 +208,7 @@ func connectionRecord(event trafficcontrol.ConnectionEvent, observedAt time.Time
 		downloadBytes = metadata.Download.Load()
 	}
 
-	attrs := make([]otelLog.KeyValue, 0, 11)
+	attrs := make([]otelLog.KeyValue, 0, 12)
 	attrs = append(attrs,
 		otelLog.String("connection.id", event.ID.String()),
 		otelLog.Int64("source.port", int64(metadata.Metadata.Source.Port)),
@@ -222,9 +223,25 @@ func connectionRecord(event trafficcontrol.ConnectionEvent, observedAt time.Time
 	if source := metadata.Metadata.Source; source.Addr.IsValid() {
 		attrs = append(attrs, otelLog.String("source.ip", source.Addr.String()))
 	}
+	if destinationDomain := connectionDomain(metadata.Metadata); destinationDomain != "" {
+		attrs = append(attrs, otelLog.String("destination.domain", destinationDomain))
+	}
 	if metadata.Metadata.User != "" {
 		attrs = append(attrs, otelLog.String("user", metadata.Metadata.User))
 	}
 	record.AddAttributes(attrs...)
 	return record
+}
+
+func connectionDomain(metadata adapter.InboundContext) string {
+	for _, domain := range []string{metadata.Domain, metadata.Destination.Fqdn} {
+		if domain == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(domain); err == nil {
+			continue
+		}
+		return domain
+	}
+	return ""
 }
