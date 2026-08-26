@@ -113,6 +113,8 @@ func Context(
 }
 
 func New(options Options) (*Box, error) {
+	// Add the synthetic service before deciding whether the traffic manager is needed.
+	autoEnableTrafficTelemetry(&options.Options)
 	createdAt := time.Now()
 	ctx := options.Context
 	if ctx == nil {

@@ -38,9 +38,10 @@ var _ adapter.Service = (*Service)(nil)
 
 type Service struct {
 	boxService.Adapter
-	trafficManager *trafficcontrol.Manager
-	provider       *sdklog.LoggerProvider
-	logger         otelLog.Logger
+	trafficManager  *trafficcontrol.Manager
+	exporterOptions []otlploghttp.Option
+	provider        *sdklog.LoggerProvider
+	logger          otelLog.Logger
 
 	eventContext     context.Context
 	eventCancel      context.CancelFunc
@@ -50,38 +51,37 @@ type Service struct {
 }
 
 func NewService(ctx context.Context, _ boxLog.ContextLogger, tag string, options option.TrafficTelemetryServiceOptions) (adapter.Service, error) {
-	endpoint, err := parseEndpoint(options.Endpoint)
-	if err != nil {
-		return nil, err
+	var exporterOptions []otlploghttp.Option
+	if options.UseEnvironment {
+		// WithHTTPClient bypasses otlploghttp's standard environment settings,
+		// so use a direct proxy function and let the exporter create its client.
+		exporterOptions = []otlploghttp.Option{
+			otlploghttp.WithProxy(directHTTPProxy),
+		}
+	} else {
+		endpoint, err := parseEndpoint(options.Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		exporterOptions = []otlploghttp.Option{
+			otlploghttp.WithEndpointURL(endpoint.String()),
+			otlploghttp.WithURLPath(logsPath(endpoint)),
+			otlploghttp.WithHeaders(options.Headers),
+			otlploghttp.WithHTTPClient(newHTTPClient()),
+		}
 	}
 	trafficManager := service.PtrFromContext[trafficcontrol.Manager](ctx)
 	if trafficManager == nil {
 		return nil, E.New("missing traffic manager")
 	}
-
-	exporter, err := otlploghttp.New(
-		ctx,
-		otlploghttp.WithEndpointURL(endpoint.String()),
-		otlploghttp.WithURLPath(logsPath(endpoint)),
-		otlploghttp.WithHeaders(options.Headers),
-		otlploghttp.WithHTTPClient(newHTTPClient()),
-	)
-	if err != nil {
-		return nil, E.Cause(err, "create OTLP HTTP log exporter")
-	}
-	provider := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
-		sdklog.WithResource(newResource()),
-	)
 	eventContext, eventCancel := context.WithCancel(ctx)
 
 	return &Service{
-		Adapter:        boxService.NewAdapter(C.TypeTrafficTelemetry, tag),
-		trafficManager: trafficManager,
-		provider:       provider,
-		logger:         provider.Logger("sing-box/traffic-telemetry"),
-		eventContext:   eventContext,
-		eventCancel:    eventCancel,
+		Adapter:         boxService.NewAdapter(C.TypeTrafficTelemetry, tag),
+		trafficManager:  trafficManager,
+		exporterOptions: exporterOptions,
+		eventContext:    eventContext,
+		eventCancel:     eventCancel,
 	}, nil
 }
 
@@ -89,9 +89,23 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateInitialize || s.eventLoopDone != nil {
 		return nil
 	}
+	exporter, err := otlploghttp.New(s.eventContext, s.exporterOptions...)
+	if err != nil {
+		return E.Cause(err, "create OTLP HTTP log exporter")
+	}
+	s.provider = sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
+		sdklog.WithResource(newResource()),
+	)
+	s.logger = s.provider.Logger("sing-box/traffic-telemetry")
+
 	subscription, done, err := s.trafficManager.SubscribeEvents()
 	if err != nil {
-		return E.Cause(err, "subscribe traffic events")
+		startErr := E.Cause(err, "subscribe traffic events")
+		shutdownErr := s.shutdownProvider()
+		return E.Append(startErr, shutdownErr, func(err error) error {
+			return E.Cause(err, "shutdown OTLP log provider")
+		})
 	}
 	s.subscription = subscription
 	s.subscriptionDone = done
@@ -144,7 +158,7 @@ func (s *Service) handleEvent(event trafficcontrol.ConnectionEvent) {
 }
 
 func (s *Service) Close() error {
-	if s.subscription != nil {
+	if s.subscription != nil && s.trafficManager != nil {
 		s.trafficManager.UnSubscribeEvents(s.subscription)
 	}
 	if s.eventLoopDone != nil {
@@ -153,10 +167,20 @@ func (s *Service) Close() error {
 	if s.eventCancel != nil {
 		s.eventCancel()
 	}
+	return s.shutdownProvider()
+}
+
+func (s *Service) shutdownProvider() error {
+	provider := s.provider
+	if provider == nil {
+		return nil
+	}
+	s.provider = nil
+	s.logger = nil
 
 	shutdownContext, cancel := context.WithTimeout(context.Background(), C.StopTimeout)
 	defer cancel()
-	return s.provider.Shutdown(shutdownContext)
+	return provider.Shutdown(shutdownContext)
 }
 
 func parseEndpoint(raw string) (*url.URL, error) {
@@ -189,6 +213,10 @@ func newHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return &http.Client{Transport: transport, Timeout: 10 * time.Second}
+}
+
+func directHTTPProxy(*http.Request) (*url.URL, error) {
+	return nil, nil
 }
 
 func logsPath(endpoint *url.URL) string {

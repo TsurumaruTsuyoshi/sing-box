@@ -32,6 +32,12 @@ When updating upstream, check changes to `protocol/group/urltest.go` carefully. 
 
 Upstream now provides `client_metadata` on AnyTLS outbounds and rewrites the `client=` settings field itself. Use that option for servers that require a specific client identifier. The old local `client_id` option and `changchinlan/sing-anytls` fork are obsolete and must not be restored.
 
+## Traffic telemetry
+
+The `traffic-telemetry` service remains available as an explicit JSON service, but a non-empty `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` adds one runtime-only service when the config has no explicit telemetry service. The synthetic service is added in `box.New` before the traffic manager requirement is calculated, and its exporter/provider are created at initialize time rather than during `NewService`; this keeps `sing-box check` from leaking a batch-processor goroutine. Keep the standard config free of the custom service type.
+
+The environment exporter must let `otlploghttp` consume its standard signal-specific settings, including the exact `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` path. Do not replace this with a custom endpoint parser or client that suppresses the standard timeout/TLS settings. Explicit JSON endpoints remain base URLs with `/v1/logs` appended.
+
 ## Build
 
 ```bash

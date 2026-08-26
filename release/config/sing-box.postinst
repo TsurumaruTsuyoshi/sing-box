@@ -1,3 +1,10 @@
 #!/bin/sh
 
 systemd-sysusers sing-box.conf
+sysusers_status=$?
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || :
+fi
+
+exit "$sysusers_status"

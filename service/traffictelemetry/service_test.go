@@ -142,6 +142,51 @@ func TestParseEndpoint(t *testing.T) {
 	}
 }
 
+func TestUnstartedServiceCloseDoesNotCreateExporter(t *testing.T) {
+	requestSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requestSeen <- struct{}{}
+	}))
+	defer server.Close()
+
+	trafficManager := trafficcontrol.NewManager(nil)
+	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
+	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
+		Endpoint: server.URL,
+	})
+	require.NoError(t, err)
+	telemetryService := serviceValue.(*Service)
+	require.Nil(t, telemetryService.provider)
+	require.Nil(t, telemetryService.logger)
+
+	require.NoError(t, telemetryService.Close())
+	require.NoError(t, telemetryService.Close())
+	require.Nil(t, telemetryService.provider)
+	select {
+	case <-requestSeen:
+		t.Fatal("unstarted service made an export request")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestServiceStartFailureShutsDownProvider(t *testing.T) {
+	trafficManager := trafficcontrol.NewManager(nil)
+	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
+	require.NoError(t, trafficManager.Close())
+	defer trafficManager.Close()
+
+	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
+	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
+		Endpoint: "http://127.0.0.1:1",
+	})
+	require.NoError(t, err)
+	telemetryService := serviceValue.(*Service)
+	require.Error(t, telemetryService.Start(adapter.StartStateInitialize))
+	require.Nil(t, telemetryService.provider)
+	require.Nil(t, telemetryService.logger)
+	require.NoError(t, telemetryService.Close())
+}
+
 func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	requestBody := make(chan []byte, 1)
 	requestPath := make(chan string, 1)
@@ -154,6 +199,8 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", server.URL+"/environment/v1/logs")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Test=environment")
 
 	// A non-nil HTTP proxy must not affect this service's direct host transport.
 	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
@@ -173,6 +220,10 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	})
 	require.NoError(t, err)
 	service := serviceValue.(*Service)
+	require.Nil(t, service.provider)
+	require.NoError(t, service.Start(adapter.StartStateInitialize))
+	trafficManager.UnSubscribeEvents(service.subscription)
+	<-service.eventLoopDone
 
 	id, err := uuid.FromString("01234567-89ab-cdef-0123-456789abcdef")
 	require.NoError(t, err)
@@ -227,6 +278,49 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	require.Equal(t, int64(1234), attrs["duration.ms"].GetIntValue())
 	require.NotContains(t, attrs, "destination")
 	require.NotContains(t, attrs, "chain")
+}
+
+func TestEnvironmentServiceUsesStandardExporterConfiguration(t *testing.T) {
+	requestPath := make(chan string, 1)
+	requestHeader := make(chan string, 1)
+	requestEncoding := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		requestPath <- request.URL.Path
+		requestHeader <- request.Header.Get("X-Environment")
+		requestEncoding <- request.Header.Get("Content-Encoding")
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", server.URL+"/collector/v1/logs")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Environment=present")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "1000")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		t.Setenv(key, "http://127.0.0.1:1")
+	}
+	for _, key := range []string{"NO_PROXY", "no_proxy"} {
+		t.Setenv(key, "")
+	}
+
+	trafficManager := trafficcontrol.NewManager(nil)
+	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
+	defer trafficManager.Close()
+	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
+	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
+		UseEnvironment: true,
+	})
+	require.NoError(t, err)
+	telemetryService := serviceValue.(*Service)
+	require.Nil(t, telemetryService.provider)
+	require.NoError(t, telemetryService.Start(adapter.StartStateInitialize))
+	telemetryService.handleEvent(testConnectionEvent(uuid.Must(uuid.NewV4()), time.Unix(100, 0), "shadowsocks"))
+
+	require.NoError(t, telemetryService.Close())
+	require.Equal(t, "/collector/v1/logs", receiveRequestValue(t, requestPath))
+	require.Equal(t, "present", receiveRequestValue(t, requestHeader))
+	require.Equal(t, "gzip", receiveRequestValue(t, requestEncoding))
 }
 
 func testConnectionEvent(id uuid.UUID, closedAt time.Time, outboundType string) trafficcontrol.ConnectionEvent {
