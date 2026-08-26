@@ -17,7 +17,6 @@ import (
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	boxLog "github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/metadata"
 	singService "github.com/sagernet/sing/service"
 
@@ -25,6 +24,11 @@ import (
 	collogpb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	otelLogsEndpointEnvironment    = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+	otelGenericEndpointEnvironment = "OTEL_EXPORTER_OTLP_ENDPOINT"
 )
 
 func TestConnectionRecord(t *testing.T) {
@@ -111,76 +115,29 @@ func TestConnectionRecordOptionalFields(t *testing.T) {
 	require.Equal(t, otelLog.KindInt64, attrs["duration.ms"].Kind())
 }
 
-func TestParseEndpoint(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-		path string
-	}{
-		{name: "http", raw: "http://127.0.0.1:4318", path: "/v1/logs"},
-		{name: "https", raw: "https://collector:4318", path: "/v1/logs"},
-		{name: "base path", raw: "http://collector:4318/otlp/", path: "/otlp/v1/logs"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			endpoint, err := parseEndpoint(test.raw)
-			require.NoError(t, err)
-			require.Equal(t, test.path, logsPath(endpoint))
-		})
-	}
-
-	for _, raw := range []string{
-		"",
-		"ftp://127.0.0.1:4318",
-		"http://",
-		"http://user@127.0.0.1:4318",
-		"http://127.0.0.1:4318?token=secret",
-		"http://127.0.0.1:4318#logs",
-	} {
-		_, err := parseEndpoint(raw)
-		require.Error(t, err, raw)
-	}
-}
-
 func TestUnstartedServiceCloseDoesNotCreateExporter(t *testing.T) {
-	requestSeen := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requestSeen <- struct{}{}
-	}))
-	defer server.Close()
-
 	trafficManager := trafficcontrol.NewManager(nil)
 	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
-	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
-		Endpoint: server.URL,
-	})
+	telemetryService, err := NewService(ctx, boxLog.NewNOPFactory().Logger())
 	require.NoError(t, err)
-	telemetryService := serviceValue.(*Service)
 	require.Nil(t, telemetryService.provider)
 	require.Nil(t, telemetryService.logger)
 
 	require.NoError(t, telemetryService.Close())
 	require.NoError(t, telemetryService.Close())
 	require.Nil(t, telemetryService.provider)
-	select {
-	case <-requestSeen:
-		t.Fatal("unstarted service made an export request")
-	case <-time.After(50 * time.Millisecond):
-	}
 }
 
 func TestServiceStartFailureShutsDownProvider(t *testing.T) {
+	t.Setenv(otelLogsEndpointEnvironment, "http://127.0.0.1:1/v1/logs")
 	trafficManager := trafficcontrol.NewManager(nil)
 	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
 	require.NoError(t, trafficManager.Close())
 	defer trafficManager.Close()
 
 	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
-	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
-		Endpoint: "http://127.0.0.1:1",
-	})
+	telemetryService, err := NewService(ctx, boxLog.NewNOPFactory().Logger())
 	require.NoError(t, err)
-	telemetryService := serviceValue.(*Service)
 	require.Error(t, telemetryService.Start(adapter.StartStateInitialize))
 	require.Nil(t, telemetryService.provider)
 	require.Nil(t, telemetryService.logger)
@@ -214,12 +171,8 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
 	defer trafficManager.Close()
 	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
-	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
-		Endpoint: server.URL + "/collector/",
-		Headers:  map[string]string{"X-Test": "present"},
-	})
+	service, err := NewService(ctx, boxLog.NewNOPFactory().Logger())
 	require.NoError(t, err)
-	service := serviceValue.(*Service)
 	require.Nil(t, service.provider)
 	require.NoError(t, service.Start(adapter.StartStateInitialize))
 	trafficManager.UnSubscribeEvents(service.subscription)
@@ -246,8 +199,8 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	// Close unsubscribes first; the event loop must drain the three buffered
 	// events before the provider is shut down.
 	require.NoError(t, service.Close())
-	require.Equal(t, "/collector/v1/logs", receiveRequestValue(t, requestPath))
-	require.Equal(t, "present", receiveRequestValue(t, requestHeader))
+	require.Equal(t, "/environment/v1/logs", receiveRequestValue(t, requestPath))
+	require.Equal(t, "environment", receiveRequestValue(t, requestHeader))
 
 	var exportRequest collogpb.ExportLogsServiceRequest
 	require.NoError(t, proto.Unmarshal(receiveRequestBody(t, requestBody), &exportRequest))
@@ -280,47 +233,88 @@ func TestServiceCloseDrainsEventsAndFlushesProvider(t *testing.T) {
 	require.NotContains(t, attrs, "chain")
 }
 
-func TestEnvironmentServiceUsesStandardExporterConfiguration(t *testing.T) {
-	requestPath := make(chan string, 1)
-	requestHeader := make(chan string, 1)
-	requestEncoding := make(chan string, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		_, _ = io.Copy(io.Discard, request.Body)
-		requestPath <- request.URL.Path
-		requestHeader <- request.Header.Get("X-Environment")
-		requestEncoding <- request.Header.Get("Content-Encoding")
-		writer.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+func TestServiceUsesStandardExporterConfiguration(t *testing.T) {
+	t.Run("signal endpoint and settings take precedence", func(t *testing.T) {
+		requestPath := make(chan string, 1)
+		requestHeader := make(chan string, 1)
+		requestEncoding := make(chan string, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			_, _ = io.Copy(io.Discard, request.Body)
+			requestPath <- request.URL.Path
+			requestHeader <- request.Header.Get("X-Environment")
+			requestEncoding <- request.Header.Get("Content-Encoding")
+			writer.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
 
-	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", server.URL+"/collector/v1/logs")
-	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Environment=present")
-	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "1000")
-	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+		t.Setenv(otelLogsEndpointEnvironment, server.URL+"/signal/logs")
+		t.Setenv(otelGenericEndpointEnvironment, server.URL+"/generic")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "X-Environment=signal")
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "X-Environment=generic")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "1000")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "gzip")
+		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "none")
+		setInvalidHTTPProxyEnvironment(t)
+
+		telemetryService := newStartedService(t)
+		telemetryService.handleEvent(testConnectionEvent(uuid.Must(uuid.NewV4()), time.Unix(100, 0), "shadowsocks"))
+		require.NoError(t, telemetryService.Close())
+
+		require.Equal(t, "/signal/logs", receiveRequestValue(t, requestPath))
+		require.Equal(t, "signal", receiveRequestValue(t, requestHeader))
+		require.Equal(t, "gzip", receiveRequestValue(t, requestEncoding))
+	})
+
+	t.Run("generic endpoint gets the logs path", func(t *testing.T) {
+		requestPath := make(chan string, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			_, _ = io.Copy(io.Discard, request.Body)
+			requestPath <- request.URL.Path
+			writer.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		t.Setenv(otelLogsEndpointEnvironment, "")
+		t.Setenv(otelGenericEndpointEnvironment, server.URL+"/generic")
+
+		telemetryService := newStartedService(t)
+		telemetryService.handleEvent(testConnectionEvent(uuid.Must(uuid.NewV4()), time.Unix(100, 0), "shadowsocks"))
+		require.NoError(t, telemetryService.Close())
+
+		require.Equal(t, "/generic/v1/logs", receiveRequestValue(t, requestPath))
+	})
+}
+
+func TestServiceCloseIgnoresExporterErrors(t *testing.T) {
+	t.Setenv(otelLogsEndpointEnvironment, "http://127.0.0.1:1/v1/logs")
+	t.Setenv(otelGenericEndpointEnvironment, "")
+	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "1")
+
+	telemetryService := newStartedService(t)
+	telemetryService.handleEvent(testConnectionEvent(uuid.Must(uuid.NewV4()), time.Unix(100, 0), "shadowsocks"))
+	require.NoError(t, telemetryService.Close())
+}
+
+func newStartedService(t *testing.T) *Service {
+	t.Helper()
+	trafficManager := trafficcontrol.NewManager(nil)
+	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
+	t.Cleanup(func() { require.NoError(t, trafficManager.Close()) })
+	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
+	telemetryService, err := NewService(ctx, boxLog.NewNOPFactory().Logger())
+	require.NoError(t, err)
+	require.NoError(t, telemetryService.Start(adapter.StartStateInitialize))
+	return telemetryService
+}
+
+func setInvalidHTTPProxyEnvironment(t *testing.T) {
+	t.Helper()
 	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
 		t.Setenv(key, "http://127.0.0.1:1")
 	}
 	for _, key := range []string{"NO_PROXY", "no_proxy"} {
 		t.Setenv(key, "")
 	}
-
-	trafficManager := trafficcontrol.NewManager(nil)
-	require.NoError(t, trafficManager.Start(adapter.StartStateInitialize))
-	defer trafficManager.Close()
-	ctx := singService.ContextWithPtr(context.Background(), trafficManager)
-	serviceValue, err := NewService(ctx, boxLog.NewNOPFactory().Logger(), "telemetry", option.TrafficTelemetryServiceOptions{
-		UseEnvironment: true,
-	})
-	require.NoError(t, err)
-	telemetryService := serviceValue.(*Service)
-	require.Nil(t, telemetryService.provider)
-	require.NoError(t, telemetryService.Start(adapter.StartStateInitialize))
-	telemetryService.handleEvent(testConnectionEvent(uuid.Must(uuid.NewV4()), time.Unix(100, 0), "shadowsocks"))
-
-	require.NoError(t, telemetryService.Close())
-	require.Equal(t, "/collector/v1/logs", receiveRequestValue(t, requestPath))
-	require.Equal(t, "present", receiveRequestValue(t, requestHeader))
-	require.Equal(t, "gzip", receiveRequestValue(t, requestEncoding))
 }
 
 func testConnectionEvent(id uuid.UUID, closedAt time.Time, outboundType string) trafficcontrol.ConnectionEvent {

@@ -79,6 +79,7 @@ nav:
       - Misc:
           - TunnelVision: manual/misc/tunnelvision.md
           - AnyTLS client metadata: manual/misc/anytls-client-metadata.md
+          - Traffic Telemetry (environment): configuration/service/traffic-telemetry.md
   - Configuration:
       - configuration/index.md
       - JSON Schema: configuration/schema.md
@@ -209,7 +210,6 @@ nav:
           - DERP: configuration/service/derp.md
           - Resolved: configuration/service/resolved.md
           - SSM API: configuration/service/ssm-api.md
-          - Traffic Telemetry: configuration/service/traffic-telemetry.md
           - CCM: configuration/service/ccm.md
           - OCM: configuration/service/ocm.md
           - Hysteria Realm: configuration/service/hysteria-realm.md

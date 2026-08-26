@@ -16615,30 +16615,6 @@
           "type": "object",
           "properties": {
             "type": {
-              "const": "traffic-telemetry"
-            },
-            "tag": {
-              "type": "string"
-            },
-            "endpoint": {
-              "type": "string"
-            },
-            "headers": {
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              }
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {
               "const": "usbip-client"
             },
             "tag": {

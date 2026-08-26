@@ -35,7 +35,6 @@ const (
 	TypeResolved           = "resolved"
 	TypeSSMAPI             = "ssm-api"
 	TypeAPI                = "api"
-	TypeTrafficTelemetry   = "traffic-telemetry"
 	TypeCCM                = "ccm"
 	TypeOCM                = "ocm"
 	TypeOOMKiller          = "oom-killer"

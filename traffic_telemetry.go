@@ -2,26 +2,15 @@ package box
 
 import (
 	"os"
-
-	"github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
+	"strings"
 )
 
-const otelLogsEndpointEnvironment = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+const (
+	otelLogsEndpointEnvironment    = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+	otelGenericEndpointEnvironment = "OTEL_EXPORTER_OTLP_ENDPOINT"
+)
 
-func autoEnableTrafficTelemetry(options *option.Options) {
-	if os.Getenv(otelLogsEndpointEnvironment) == "" {
-		return
-	}
-	for _, service := range options.Services {
-		if service.Type == constant.TypeTrafficTelemetry {
-			return
-		}
-	}
-	options.Services = append(options.Services, option.Service{
-		Type: constant.TypeTrafficTelemetry,
-		Options: &option.TrafficTelemetryServiceOptions{
-			UseEnvironment: true,
-		},
-	})
+func isTrafficTelemetryEnabled() bool {
+	return strings.TrimSpace(os.Getenv(otelLogsEndpointEnvironment)) != "" ||
+		strings.TrimSpace(os.Getenv(otelGenericEndpointEnvironment)) != ""
 }

@@ -4,53 +4,50 @@ icon: material/new-box
 
 # 流量遥测
 
-`traffic-telemetry` 服务收到所跟踪连接的关闭事件后，会导出一条 OTLP 日志记录。
-DNS 伪连接不会被导出。
+sing-box 可以在所跟踪的连接关闭时导出一条 OTLP 日志记录；DNS 伪连接不会导出。
+这是一个只通过环境变量启用的运维功能，不是 JSON 服务配置。
 
-发送采用尽力而为方式，数据只缓存在内存中。持续的连接突发可能塞满有限的 buffer；sing-box 关闭时仍然活跃的连接不会被导出。
+### 启用
 
-端点通过主机直接连接，不使用 sing-box 出站路由或代理环境变量。支持 HTTP 和 HTTPS。
+以下任一变量包含非空白内容时启用：
 
-### 启用方式
+- `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
+- `OTEL_EXPORTER_OTLP_ENDPOINT`
 
-在支持该服务类型时，仍可使用文档中的 JSON 服务配置，见下方的[结构](#结构)。
+只有空格等空白内容不会启用功能。服务会在启动时内部合成，因此不要在 JSON 配置中添加
+`traffic-telemetry` 对象。
 
-此外，当 `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` 非空且 JSON 配置中没有
-`traffic-telemetry` 服务时，本版本会自动启用一个服务。通过环境变量启用时，
-exporter 会自行读取 `otlploghttp` 的标准环境变量，包括
-`OTEL_EXPORTER_OTLP_LOGS_HEADERS`、`OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` 和
-`OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`。
+### 端点与 exporter 设置
 
-`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` 是完整的信号 URL，路径会按原样使用。例如应设置为
-`http://10.140.2.231:4318/v1/logs`；此模式不会再追加 `/v1/logs`。
-JSON 配置本身不包含自定义服务类型，因此官方或较旧的 sing-box 二进制仍可解析并启动同一份配置；
-它们只会忽略这些环境变量。
+标准 `otlploghttp` exporter 会直接从环境变量读取端点以及其他 OTel 设置。sing-box 不提供
+自定义的端点、请求头、超时、压缩或 TLS 字段。
 
-### 结构
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` 是日志信号专用端点，优先于
+`OTEL_EXPORTER_OTLP_ENDPOINT`，并且完整 URL 的路径会按原样使用：
 
-```json
-{
-  "services": [
-    {
-      "type": "traffic-telemetry",
-      "endpoint": "http://10.140.2.231:4318",
-      "headers": {
-        "Authorization": "Bearer <token>"
-      }
-    }
-  ]
-}
+```text
+OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://collector:4318/custom/logs
 ```
 
-### 字段
+`OTEL_EXPORTER_OTLP_ENDPOINT` 是通用 OTLP 基础端点，exporter 会在其路径后追加 `/v1/logs`：
 
-#### endpoint
+```text
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318/otlp
+# 日志发送到 /otlp/v1/logs
+```
 
-==必填==
+其他 OTel 设置也遵循信号专用变量优先于通用变量的规则。例如请求头使用
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS` 或 `OTEL_EXPORTER_OTLP_HEADERS`，超时使用
+`OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` 或 `OTEL_EXPORTER_OTLP_TIMEOUT`，压缩和 TLS 也相同。
+exporter 会保留这些标准设置，包括 gzip、自定义请求头、超时、证书和客户端证书。
 
-完整的 OTLP/HTTP 基础端点。服务会在其后追加 `/v1/logs`。此字段只用于显式 JSON 配置；
-环境变量模式会按原样使用 `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` 中的完整 URL。
+collector 通过主机直接连接；这次导出不会使用 sing-box 出站路由或 HTTP 代理环境变量。
 
-#### headers
+### 发送与关闭
 
-可选的 HTTP 请求头，会随每个 OTLP 请求发送。
+发送采用尽力而为方式。记录缓存在有限的内存队列中；队列满时可能丢弃记录，sing-box 停止时
+仍然活跃的连接也不会导出。collector 不可用不会阻塞启动或正常流量处理。
+
+关闭或 reload 时，sing-box 会先排空流量事件订阅，再使用正常的停止超时进行一次有界的
+flush 尝试。flush 或 exporter 关闭错误会记录日志并忽略，因此 collector 不可用不会把关闭
+或 reload 变成失败。截止时间前未能 flush 的记录可能丢失。

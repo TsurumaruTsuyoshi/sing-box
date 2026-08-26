@@ -9,12 +9,18 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
-	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
 	singService "github.com/sagernet/sing/service"
 )
 
-func TestAutoEnabledTrafficTelemetryInstantiatesManagers(t *testing.T) {
+func TestTrafficTelemetryServiceIsInternal(t *testing.T) {
+	registry := include.ServiceRegistry()
+	_, loaded := registry.CreateOptions("traffic-telemetry")
+	require.False(t, loaded)
+	require.NotContains(t, registry.OptionTypes(), "traffic-telemetry")
+}
+
+func TestTelemetryEnvironmentInstantiatesTrafficManagerWithoutPublicService(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://127.0.0.1:1/v1/logs")
 	ctx := include.Context(context.Background())
 	instance, err := box.New(box.Options{Context: ctx})
@@ -22,15 +28,9 @@ func TestAutoEnabledTrafficTelemetryInstantiatesManagers(t *testing.T) {
 
 	serviceManager := singService.FromContext[adapter.ServiceManager](ctx)
 	require.NotNil(t, serviceManager)
-	t.Cleanup(func() {
-		for _, service := range serviceManager.Services() {
-			_ = service.Close()
-		}
-		_ = instance.Close()
-	})
+	require.NoError(t, instance.Start())
+	t.Cleanup(func() { _ = instance.Close() })
 
 	require.NotNil(t, singService.PtrFromContext[trafficcontrol.Manager](ctx))
-	services := serviceManager.Services()
-	require.Len(t, services, 1)
-	require.Equal(t, constant.TypeTrafficTelemetry, services[0].Type())
+	require.Empty(t, serviceManager.Services())
 }

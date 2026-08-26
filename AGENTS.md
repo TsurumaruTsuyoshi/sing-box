@@ -34,9 +34,9 @@ Upstream now provides `client_metadata` on AnyTLS outbounds and rewrites the `cl
 
 ## Traffic telemetry
 
-The `traffic-telemetry` service remains available as an explicit JSON service, but a non-empty `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` adds one runtime-only service when the config has no explicit telemetry service. The synthetic service is added in `box.New` before the traffic manager requirement is calculated, and its exporter/provider are created at initialize time rather than during `NewService`; this keeps `sing-box check` from leaking a batch-processor goroutine. Keep the standard config free of the custom service type.
+Traffic telemetry exists only as an internally synthesized service. A non-whitespace `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` activates it; the standard JSON configuration must not contain a telemetry service type. The synthetic service is added in `box.New` before the traffic manager requirement is calculated, and its exporter/provider are created at initialize time rather than during service construction; this keeps `sing-box check` from leaking a batch-processor goroutine. Keep the standard config free of the private service type.
 
-The environment exporter must let `otlploghttp` consume its standard signal-specific settings, including the exact `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` path. Do not replace this with a custom endpoint parser or client that suppresses the standard timeout/TLS settings. Explicit JSON endpoints remain base URLs with `/v1/logs` appended.
+The environment exporter must let `otlploghttp` consume its standard signal-specific settings, including signal endpoint precedence and the exact `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` path. Do not replace this with a custom endpoint parser or client that suppresses the standard timeout/TLS settings. The generic endpoint gets `/v1/logs` appended by `otlploghttp`; signal-specific endpoint paths are used as supplied. Telemetry is best-effort: close/reload drains the event queue and attempts a bounded flush, but exporter errors are logged and ignored.
 
 ## Build
 

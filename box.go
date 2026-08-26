@@ -33,6 +33,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/route"
+	"github.com/sagernet/sing-box/service/traffictelemetry"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -113,8 +114,7 @@ func Context(
 }
 
 func New(options Options) (*Box, error) {
-	// Add the synthetic service before deciding whether the traffic manager is needed.
-	autoEnableTrafficTelemetry(&options.Options)
+	trafficTelemetryEnabled := isTrafficTelemetryEnabled()
 	createdAt := time.Now()
 	ctx := options.Context
 	if ctx == nil {
@@ -170,9 +170,7 @@ func New(options Options) (*Box, error) {
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
-	needTrafficManager := needClashAPI || needAPIService || options.PlatformLogWriter != nil || common.Any(options.Services, func(it option.Service) bool {
-		return it.Type == C.TypeTrafficTelemetry
-	})
+	needTrafficManager := needClashAPI || needAPIService || options.PlatformLogWriter != nil || trafficTelemetryEnabled
 	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
 		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
 	}
@@ -262,6 +260,13 @@ func New(options Options) (*Box, error) {
 		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
 		service.MustRegisterPtr(ctx, clashMode)
 		internalServices = append(internalServices, clashMode)
+		if trafficTelemetryEnabled {
+			telemetryService, err := traffictelemetry.NewService(ctx, logFactory.NewLogger("traffic telemetry"))
+			if err != nil {
+				return nil, E.Cause(err, "initialize traffic telemetry")
+			}
+			internalServices = append(internalServices, telemetryService)
+		}
 	}
 	referenceManager := route.NewReferenceManager(ctx, logFactory.NewLogger("reference"), options.Options)
 	internalServices = append(internalServices, referenceManager)
