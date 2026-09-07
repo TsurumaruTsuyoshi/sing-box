@@ -1,6 +1,8 @@
 # AGENTS.md — sing-box (local patched)
 
-Based on upstream `SagerNet/sing-box` branch `testing`, currently `v1.14.0-beta.14`.
+Based on upstream `SagerNet/sing-box` branch `testing`, currently `v1.14.0-47` (rebased 2026-09-07 onto `60b504a1c`).
+
+Note that upstream force-pushes `testing`: it rewrites the whole branch history after tagging, so commits we took from upstream keep their content but get new hashes. `git merge-base` then walks back much further than our real starting point, and a bare `git rebase upstream/testing` will try to replay a couple hundred upstream commits as if they were ours. Rebase with an explicit boundary instead — `git rebase --onto upstream/testing <last-upstream-commit-on-our-branch>` — and check the blood relation before believing any range. Tags are not reliable ancestors either; `v1.15.0-alpha.1` and `alpha.2` are currently contained in no branch at all.
 
 ## Local patch
 
@@ -8,17 +10,17 @@ Based on upstream `SagerNet/sing-box` branch `testing`, currently `v1.14.0-beta.
 
 Real TCP/UDP dial failures feed a per-outbound, per-network circuit breaker. Three consecutive failures exclude that outbound for 30 seconds and trigger immediate reselection. A successful real dial clears both the failure count and cooldown. Caller cancellation does not count as an outbound failure.
 
-The selected TCP/UDP outbounds use `common.TypedValue` because real dials, URL tests, and interface-update checks can access selection concurrently.
+The selected TCP/UDP outbounds use `common.TypedValue` because real dials, URL tests, and interface-update checks can access selection concurrently. Upstream reads those fields from six places now — `Now`, `References`, `DialContext`, `ListenPacket`, `Select`, and `performUpdateCheck` — and `References` is the newest one, added by upstream's idle-connection cleanup. When rebasing, check that every access site went through `.Load()`; a missed one still compiles only if it happens to be assignment-free.
 
 #### What it does not catch
 
-The breaker is fed at `protocol/group/urltest.go:198`, where `recordSuccess` fires the moment `DialContext` returns without error. Everything after that point is invisible to it: upload stalls, transfer-time i/o timeouts, sessions the peer closed while we still hold them.
+The breaker is fed in `URLTest.DialContext` (`protocol/group/urltest.go`, at the `recordSuccess` call), which fires the moment `DialContext` returns without error. Everything after that point is invisible to it: upload stalls, transfer-time i/o timeouts, sessions the peer closed while we still hold them.
 
 Observed on 2026-08-19 with a nexitally AnyTLS endpoint. TLS handshakes kept succeeding, then the upload direction died — `connection upload closed: write tcp ...: i/o timeout`, single connections hanging 55s to 4m26s before being torn down. Twenty-two such failures on one outbound, zero breaker trips, because every one of them happened after a successful dial.
 
 The three-consecutive-failures threshold is a second gap. A sibling endpoint on the same subscription did fail at dial time (`failed to create stream: use of closed network connection`), but those ten failures were spread across several hundred successful dials, and each success resets the counter. Intermittent rot never accumulates.
 
-Trips are logged at `Debug` (`urltest.go:442`). Production runs at `INFO`, so a trip that does happen leaves no trace. Raise the log level before trying to verify breaker behaviour.
+Trips are logged at `Debug` (search `tripped breaker on`). Production runs at `INFO`, so a trip that does happen leaves no trace. Raise the log level before trying to verify breaker behaviour.
 
 The tempting fix — wrap the returned `conn` and score on observed data flow — does not work, and it is worth writing down why so nobody spends another afternoon on it. Everything past the dial is opaque: a tunnel that goes quiet for forty seconds is indistinguishable from a model that is simply thinking, and a long reasoning request whose client gives up first looks exactly like a dead route. Passive traffic shape cannot separate a broken path from a slow answer.
 
@@ -43,3 +45,5 @@ The environment exporter must let `otlploghttp` consume its standard signal-spec
 ```bash
 nx "go gcc" -- go build -mod=mod -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api" -o sing-box ./cmd/sing-box
 ```
+
+`-mod=mod` is not decorative: this machine sets `GOFLAGS=-mod=vendor` globally, and there is no `vendor/` here (it is gitignored). Without the override every build and test fails with a wall of "is explicitly required in go.mod, but not marked as explicit in vendor/modules.txt". Pass it to `go test` too.
